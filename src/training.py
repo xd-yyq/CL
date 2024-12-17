@@ -85,7 +85,13 @@ def evaluate_model(model, test_loader, device, task_id):
 
     accuracy = 100 * correct / total
     tqdm.write(f"Task {task_id} - Accuracy: {accuracy:.2f}%")
+
+    # 评估完成后，将模型移动到 CPU 并释放显存
+    model.to('cpu')
+    torch.cuda.empty_cache()
+
     return accuracy
+
 
 def save_model(model, path):
     torch.save(model.state_dict(), path)

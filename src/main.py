@@ -130,7 +130,12 @@ def main():
 
     # 初始化 CSPAgent
     try:
-        csp_agent = CSPAgent(class_splits=original_class_splits, epsilon=0.05, device=config.DEVICE)
+        csp_agent = CSPAgent(
+            class_splits=original_class_splits,
+            epsilon=0.05,
+            device=config.DEVICE,
+            model_dir=os.path.join(exp_dir, 'anchors')  # 指定模型保存目录
+        )
         logger.log("CSPAgent initialized successfully.")
     except Exception as e:
         logger.log(f"Error initializing CSPAgent: {e}")
@@ -170,12 +175,12 @@ def main():
             logger.log(f"Found existing standalone model for Task {task_id} at {model_filepath}. Loading model.")
             try:
                 # 加载模型
-                standalone_model = ViTModel(num_classes=num_classes).to(config.DEVICE)
-                standalone_model.load_state_dict(torch.load(model_filepath, map_location=config.DEVICE))
+                standalone_model = ViTModel(num_classes=num_classes)
+                standalone_model.load_state_dict(torch.load(model_filepath, map_location='cpu'))
                 standalone_model.eval()
                 logger.log(f"Standalone model for Task {task_id} loaded successfully.")
                 # 评估初始性能
-                initial_performance = evaluate_model(standalone_model, test_loaders[task_id], config.DEVICE, task_id)
+                initial_performance = evaluate_model(standalone_model, test_loaders[task_id], 'cpu', task_id)
                 logger.log(f"Task {task_id} - Initial Performance: {initial_performance:.2f}%")
             except Exception as e:
                 logger.log(f"Error loading or evaluating standalone model for Task {task_id}: {e}")
@@ -196,7 +201,8 @@ def main():
                     train_loaders[task_id],
                     criterion,
                     optimizer,
-                    config.NUM_EPOCHS,
+                    #config.NUM_EPOCHS,
+                    100,
                     config.DEVICE,
                     task_id,
                     task_output_dir  # 保存到任务目录
@@ -204,8 +210,10 @@ def main():
                 # 保存模型
                 save_model(standalone_model, model_filepath)
                 logger.log(f"Standalone model for Task {task_id} saved to {model_filepath}")
+                # 将模型移动到 CPU，释放显存
+                standalone_model.to('cpu')
                 # 评估初始性能
-                initial_performance = evaluate_model(standalone_model, test_loaders[task_id], config.DEVICE, task_id)
+                initial_performance = evaluate_model(standalone_model, test_loaders[task_id], 'cpu', task_id)
                 logger.log(f"Task {task_id} - Initial Performance after Standalone Training: {initial_performance:.2f}%")
             except Exception as e:
                 logger.log(f"Error during Standalone Training for Task {task_id}: {e}")
@@ -238,9 +246,14 @@ def main():
         csp_agent_state_path = os.path.join(task_output_dir, f'csp_agent_task_{task_id}.pth')
         csp_agent_state_path = os.path.abspath(os.path.normpath(csp_agent_state_path))
         try:
+            # 修改此处，保存 anchors 的模型路径和其他必要信息
             torch.save({
-                'anchors': [anchor.state_dict() for anchor in csp_agent.anchors],
-                'alphas': csp_agent.alphas
+                'anchors': csp_agent.anchors,  # 现在 anchors 是模型路径的列表
+                'anchor_tasks': csp_agent.anchor_tasks,
+                'alphas': csp_agent.alphas,
+                'class_splits': csp_agent.class_splits,
+                'num_classes_list': csp_agent.num_classes_list,
+                'epsilon': csp_agent.epsilon
             }, csp_agent_state_path)
             logger.log(f"CSPAgent state saved to {csp_agent_state_path}")
         except Exception as e:
@@ -262,10 +275,13 @@ def main():
             logger.log(f"No Alpha vector found for Task {task_id}. Skipping evaluation.")
 
     # 在所有任务上评估，检查是否发生遗忘
+    # 在最终评估部分
     for task_id in range(config.NUM_TASKS):
         alpha = csp_agent.alphas.get(task_id)
         if alpha is not None:
             try:
+                # 确保 alpha 在正确的设备上
+                alpha = alpha.to(config.DEVICE)
                 accuracy = csp_agent.evaluate_policy(test_loaders[task_id], alpha=alpha)
                 logger.log(f"Final Evaluation on Task {task_id} - Accuracy: {accuracy:.2f}%")
                 csp_agent.task_performances[task_id]['final_performance'] = accuracy
@@ -273,8 +289,6 @@ def main():
                 logger.log(f"Error during final evaluation on Task {task_id}: {e}")
                 logger.close()
                 return
-        else:
-            logger.log(f"No Alpha vector found for Task {task_id}. Skipping final evaluation.")
 
     # 计算平均性能
     total_performance = sum(
@@ -307,10 +321,17 @@ def main():
 
     # 计算模型大小
     if len(csp_agent.anchors) > 0:
-        single_anchor_params = sum(p.numel() for p in csp_agent.anchors[0].parameters())
-        total_params = sum(p.numel() for anchor in csp_agent.anchors for p in anchor.parameters())
+        # 需要加载一个锚点模型来计算参数数量
+        task_id_for_size = csp_agent.anchor_tasks[0]
+        num_classes = csp_agent.num_classes_list[task_id_for_size]
+        anchor_model = csp_agent.load_anchor(task_id_for_size, num_classes)
+        single_anchor_params = sum(p.numel() for p in anchor_model.parameters())
+        total_params = single_anchor_params * len(csp_agent.anchors)
         model_size = total_params / single_anchor_params
         logger.log(f"Model Size (relative to single anchor): {model_size:.2f}")
+        # 清理模型
+        del anchor_model
+        torch.cuda.empty_cache()
     else:
         logger.log("No anchors found. Cannot compute model size.")
 
@@ -352,8 +373,24 @@ def main():
 
     logger.log("\nAlpha vectors for each task:")
     for task_id, alpha in csp_agent.alphas.items():
-        alpha_str = np.array2string(alpha, precision=8, separator=', ')
-        logger.log(f"Task {task_id}: alpha = {alpha_str}")
+        # 将 PyTorch 张量转换为 NumPy 数组
+        if isinstance(alpha, torch.Tensor):
+            alpha_numpy = alpha.cpu().detach().numpy()
+        else:
+            alpha_numpy = np.array(alpha)
+
+        try:
+            alpha_str = np.array2string(
+                alpha_numpy,
+                precision=8,
+                separator=', ',
+                suppress_small=True,
+                formatter={'float_kind': lambda x: "%.8f" % x}
+            )
+            logger.log(f"Task {task_id}: alpha = {alpha_str}")
+        except Exception as e:
+            logger.log(f"Error formatting alpha vector for Task {task_id}: {e}")
+            logger.log(f"Raw alpha values: {alpha_numpy}")
 
     # 绘制任务与锚点的关系图
     try:

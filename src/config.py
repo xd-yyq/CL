@@ -9,7 +9,7 @@ class Config:
         self.OUTPUT_DIR = './output'
 
         self.NUM_TASKS = 5
-        self.NUM_EPOCHS = 1
+        self.NUM_EPOCHS = 100
         self.LEARNING_RATE = 0.001
         self.BATCH_SIZE = 16
         self.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
